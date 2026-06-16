@@ -18,7 +18,7 @@ const int POT_PIN = 34;
 const int TACO_PIN = 35;   
 
 // ==============================================================================
-// VARIABLES DE POTENCIA Y PLL
+// VARIABLES DE POTENCIA Y PLL DEDICADO
 // ==============================================================================
 volatile uint32_t tiempo_semiciclo = 8333; 
 volatile int estado_timer = 0;             
@@ -38,9 +38,11 @@ Preferences preferencias;
 
 int modo_operacion = 0;           
 volatile bool sistema_encendido = false; 
+volatile bool pot_bloqueado = false; 
 
 int limite_inferior_alfa = 10;
 int limite_superior_alfa = 150;
+int desfase_zcd_us = 0;
 
 int alpha_objetivo = 150;         
 volatile int alpha_actual = 180; 
@@ -48,8 +50,11 @@ volatile int alpha_actual = 180;
 int rpm_objetivo_web = 0; 
 
 volatile int velocidad_rampa_on = 15; 
-volatile int velocidad_rampa_off = 45; 
+volatile int velocidad_rampa_off = 45;
+volatile int velocidad_rampa_p7 = 3;
 volatile int ancho_pulso_us = 1000;  
+
+bool invertir_canales = false;
 
 unsigned long tiempoAnteriorRampa = 0;
 
@@ -65,14 +70,17 @@ AsyncWebServer server(80);
 TaskHandle_t TareaWeb;
 
 // ==============================================================================
-// RUTINAS DE INTERRUPCIÓN (NÚCLEO 1) - ACCESO DIRECTO A REGISTROS
+// RUTINAS DE INTERRUPCIÓN (NÚCLEO 1) - CAPA DE HARDWARE PURA
 // ==============================================================================
 void IRAM_ATTR onTimer() {
+  int pin_par_p = invertir_canales ? SCR_PAR_N_PIN : SCR_PAR_P_PIN;
+  int pin_par_n = invertir_canales ? SCR_PAR_P_PIN : SCR_PAR_N_PIN;
+  
   if (estado_timer == 1) { 
     if (es_semiciclo_positivo) {
-      GPIO.out_w1ts = ((uint32_t)1 << SCR_PAR_P_PIN); 
+      GPIO.out_w1ts = ((uint32_t)1 << pin_par_p); 
     } else {
-      GPIO.out_w1ts = ((uint32_t)1 << SCR_PAR_N_PIN); 
+      GPIO.out_w1ts = ((uint32_t)1 << pin_par_n); 
     }
     
     uint32_t margen_seguridad = 250; 
@@ -89,7 +97,7 @@ void IRAM_ATTR onTimer() {
     timerAlarmEnable(timer);
     
   } else if (estado_timer == 2) {
-    GPIO.out_w1tc = ((uint32_t)1 << SCR_PAR_P_PIN) | ((uint32_t)1 << SCR_PAR_N_PIN);
+    GPIO.out_w1tc = ((uint32_t)1 << pin_par_p) | ((uint32_t)1 << pin_par_n);
     estado_timer = 0; 
   }
 }
@@ -98,6 +106,7 @@ void IRAM_ATTR zeroCrossISR() {
   unsigned long tiempo_actual = micros();
   unsigned long delta = tiempo_actual - tiempo_ultimo_cruce;
 
+  // GUILLOTINA: Apagar SCRs de inmediato
   GPIO.out_w1tc = ((uint32_t)1 << SCR_PAR_P_PIN) | ((uint32_t)1 << SCR_PAR_N_PIN);
   timerAlarmDisable(timer);
   estado_timer = 0; 
@@ -106,31 +115,56 @@ void IRAM_ATTR zeroCrossISR() {
   if ((estado_pines & ((uint32_t)1 << SCR_PAR_P_PIN)) || (estado_pines & ((uint32_t)1 << SCR_PAR_N_PIN))) {
     return; 
   }
-  if (delta < 7000) return; 
+  
+  // FILTRO ANTI-REBOTE CLÁSICO: Ignora el "chispazo" del switch sin actualizar el tiempo
+  if (delta < 6500) return; 
 
   if (!zcd_sintonizado) {
-    if (delta < 10000) {
+    // VENTANA CLÍNICA (7.5ms a 10ms). Solo acepta ondas puras para aprender.
+    if (delta > 7500 && delta < 10000) {
       zcd_suma_tiempos += delta;
       zcd_muestras++;
+      es_semiciclo_positivo = !es_semiciclo_positivo; // Asumimos alternancia sana
+      
       if (zcd_muestras >= 60) {
         tiempo_semiciclo = zcd_suma_tiempos / 60;
         zcd_sintonizado = true;
       }
+    } else {
+      // Si el delta es enorme por prender/apagar, purgamos la muestra corrupta
+      zcd_muestras = 0;
+      zcd_suma_tiempos = 0;
     }
     tiempo_ultimo_cruce = tiempo_actual;
     return; 
   }
   
-  if (delta < 10000) {
-    tiempo_semiciclo = (tiempo_semiciclo * 3 + delta) / 4;
-  }
+  // === MODO SINTONIZADO (RUNNING) ===
   
+  if (delta > 10000 || delta < 7500) {
+     // AUTO-CORRECCIÓN DE POLARIDAD (El Salvavidas)
+     // Si el motor genera un pico que nos hace perder el cruce, o apagamos el AC
+     if (delta > 10000) {
+        int ciclos_perdidos = round((float)delta / tiempo_semiciclo);
+        if (ciclos_perdidos % 2 != 0) {
+            es_semiciclo_positivo = !es_semiciclo_positivo; // Mantenemos la fase física real
+        }
+     }
+     tiempo_ultimo_cruce = tiempo_actual;
+     return; // Abortamos el disparo en este semiciclo anómalo
+  }
+
+  // Seguimiento dinámico de la onda real
+  tiempo_semiciclo = (tiempo_semiciclo * 63 + delta) / 64;
   tiempo_ultimo_cruce = tiempo_actual; 
   es_semiciclo_positivo = !es_semiciclo_positivo;
   
-  if (alpha_actual >= 178) return; 
+  // MURO DE SILENCIO ABSOLUTO (Anti-Disparos en Inactivo)
+  if (!sistema_encendido && alpha_actual >= limite_superior_alfa) return;
+  if (alpha_actual > limite_superior_alfa) return; 
   
-  retardo_actual_us = (alpha_actual * tiempo_semiciclo) / 180;
+  int retardo_teorico = (alpha_actual * tiempo_semiciclo) / 180;
+  retardo_actual_us = retardo_teorico + desfase_zcd_us;
   
   if(retardo_actual_us < 150) retardo_actual_us = 150; 
   if(retardo_actual_us >= (tiempo_semiciclo - 350)) return; 
@@ -142,7 +176,7 @@ void IRAM_ATTR zeroCrossISR() {
 }
 
 // ==============================================================================
-// INTERPOLACIÓN
+// METROLOGÍA / INTERPOLACIÓN
 // ==============================================================================
 int extrapolarRPM(float v) {
   if (v <= calib_voltaje[0]) return calib_rpm[0];
@@ -170,15 +204,21 @@ void tareaNucleoCero(void * parameter) {
   
   kp_lineal = preferencias.getFloat("kp", 0.0015);
   ki_lineal = preferencias.getFloat("ki", 0.0080);
-  rpm_objetivo_web = preferencias.getInt("rpm_obj", 0);
+  
+  rpm_objetivo_web = preferencias.getInt("rpm_obj", 0); 
   modo_operacion = preferencias.getInt("modo", 0);
   
   limite_inferior_alfa = preferencias.getInt("lim_inf", 10);
   limite_superior_alfa = preferencias.getInt("lim_sup", 150);
   velocidad_rampa_on = preferencias.getInt("rampa_on", 15);
   velocidad_rampa_off = preferencias.getInt("rampa_off", 45);
+  velocidad_rampa_p7 = preferencias.getInt("rampa_p7", 3);
   ancho_pulso_us = preferencias.getInt("pulso", 1000);
+  desfase_zcd_us = preferencias.getInt("desfase", 0);
+  pot_bloqueado = preferencias.getBool("pot_lock", false);
+  invertir_canales = preferencias.getBool("inv_ch", false);
   
+  alpha_actual = limite_superior_alfa + 1; 
   alpha_objetivo = limite_superior_alfa; 
 
   for(int i=0; i<10; i++) {
@@ -197,12 +237,30 @@ void tareaNucleoCero(void * parameter) {
   });
 
   server.on("/modo", HTTP_GET, [](AsyncWebServerRequest *request){
-    if (sistema_encendido) {
-      request->send(400, "text/plain", "DENEGADO"); return;
-    }
+    if (sistema_encendido) { request->send(400, "text/plain", "DENEGADO"); return; }
     if (request->hasParam("val")) {
       modo_operacion = request->getParam("val")->value().toInt(); 
       preferencias.putInt("modo", modo_operacion);
+    }
+    request->send(200, "text/plain", "OK");
+  });
+
+  server.on("/recalib_zcd", HTTP_GET, [](AsyncWebServerRequest *request){
+    sistema_encendido = false; 
+    zcd_sintonizado = false;
+    zcd_muestras = 0;
+    zcd_suma_tiempos = 0;
+    GPIO.out_w1tc = ((uint32_t)1 << SCR_PAR_P_PIN) | ((uint32_t)1 << SCR_PAR_N_PIN);
+    timerAlarmDisable(timer);
+    estado_timer = 0;
+    alpha_actual = limite_superior_alfa + 1;
+    request->send(200, "text/plain", "OK");
+  });
+
+  server.on("/lock_pot", HTTP_GET, [](AsyncWebServerRequest *request){
+    if (request->hasParam("state")) {
+      pot_bloqueado = (request->getParam("state")->value() == "1");
+      preferencias.putBool("pot_lock", pot_bloqueado); 
     }
     request->send(200, "text/plain", "OK");
   });
@@ -213,7 +271,17 @@ void tareaNucleoCero(void * parameter) {
     if (request->hasParam("rampa_on")) { velocidad_rampa_on = request->getParam("rampa_on")->value().toInt(); preferencias.putInt("rampa_on", velocidad_rampa_on); }
     if (request->hasParam("rampa_off")) { velocidad_rampa_off = request->getParam("rampa_off")->value().toInt(); preferencias.putInt("rampa_off", velocidad_rampa_off); }
     if (request->hasParam("pulso")) { ancho_pulso_us = request->getParam("pulso")->value().toInt(); preferencias.putInt("pulso", ancho_pulso_us); }
+    if (request->hasParam("desfase")) { desfase_zcd_us = request->getParam("desfase")->value().toInt(); preferencias.putInt("desfase", desfase_zcd_us); }
+    if (request->hasParam("rampa_p7")) { velocidad_rampa_p7 = request->getParam("rampa_p7")->value().toInt(); preferencias.putInt("rampa_p7", velocidad_rampa_p7); }
     request->send(200, "text/plain", "OK");
+  });
+
+  server.on("/invert_ch", HTTP_GET, [](AsyncWebServerRequest *request){
+    if (request->hasParam("state")) {
+      invertir_canales = (request->getParam("state")->value() == "1");
+      preferencias.putBool("inv_ch", invertir_canales);
+    }
+    request->send(200, "text/plain", String(invertir_canales ? "1" : "0"));
   });
 
   server.on("/save_calib", HTTP_GET, [](AsyncWebServerRequest *request){
@@ -261,14 +329,13 @@ void tareaNucleoCero(void * parameter) {
   });
 
   server.on("/get", HTTP_GET, [](AsyncWebServerRequest *request){
-    // SE AGREGÓ EL ESTADO Y EL TIEMPO DEL ZCD AL PAYLOAD
-    String payload = String(alpha_objetivo) + "," + String(sistema_encendido ? 1 : 0) + "," + String(alpha_actual) + "," + String(rpm_actual) + "," + String(voltaje_taco_actual, 2) + "," + String(zcd_sintonizado ? 1 : 0) + "," + String(tiempo_semiciclo);
+    String payload = String(alpha_objetivo) + "," + String(sistema_encendido ? 1 : 0) + "," + String(alpha_actual) + "," + String(rpm_actual) + "," + String(voltaje_taco_actual, 2) + "," + String(zcd_sintonizado ? 1 : 0) + "," + String(tiempo_semiciclo) + "," + String(invertir_canales ? 1 : 0);
     request->send(200, "text/plain", payload);
   });
 
   server.on("/get_config", HTTP_GET, [](AsyncWebServerRequest *request){
     String payload = String(kp_lineal, 4) + "," + String(ki_lineal, 4) + "," + String(rpm_objetivo_web) + "," + String(modo_operacion) + "," + String(sistema_encendido ? 1 : 0) + "," + 
-                     String(limite_inferior_alfa) + "," + String(limite_superior_alfa) + "," + String(velocidad_rampa_on) + "," + String(velocidad_rampa_off) + "," + String(ancho_pulso_us);
+                     String(limite_inferior_alfa) + "," + String(limite_superior_alfa) + "," + String(velocidad_rampa_on) + "," + String(velocidad_rampa_off) + "," + String(ancho_pulso_us) + "," + String(desfase_zcd_us) + "," + String(pot_bloqueado ? 1 : 0) + "," + String(invertir_canales ? 1 : 0) + "," + String(velocidad_rampa_p7);
     for(int i=0; i<10; i++) {
       payload += "," + String(calib_voltaje[i], 2) + "," + String((int)calib_rpm[i]);
     }
@@ -308,8 +375,8 @@ void setup() {
   
   while (!zcd_sintonizado) { 
     if (millis() - timeout_calibracion > 3000) {
-      Serial.println("[ALERTA] Forzando sincronia por timeout.");
-      zcd_sintonizado = false; // Mantener estado de error latente
+      Serial.println("[ALERTA] Arrancando con parámetros base por timeout.");
+      zcd_sintonizado = false; 
       break;
     }
     delay(10); 
@@ -324,40 +391,80 @@ void setup() {
 void loop() {
   unsigned long tiempoActual = millis();
 
+  // ==============================================================================
+  // WATCHDOG ASÍNCRONO DE HARDWARE
+  // Tolerancia ampliada a 200ms para evitar falsos positivos durante el chispazo de encendido.
+  // ==============================================================================
+  unsigned long micros_actuales = micros();
+  if (micros_actuales - tiempo_ultimo_cruce > 200000) { 
+    if (zcd_sintonizado || zcd_muestras > 0) {
+      Serial.println("[WATCHDOG] Señal AC perdida. Reseteando sintonía...");
+      sistema_encendido = false; 
+      
+      zcd_sintonizado = false;
+      zcd_muestras = 0;
+      zcd_suma_tiempos = 0;
+      
+      GPIO.out_w1tc = ((uint32_t)1 << SCR_PAR_P_PIN) | ((uint32_t)1 << SCR_PAR_N_PIN);
+      timerAlarmDisable(timer);
+      estado_timer = 0;
+      alpha_actual = limite_superior_alfa + 1;
+    }
+  }
+
   int raw_taco = analogRead(TACO_PIN);
   voltaje_taco_actual = (raw_taco * 3.3) / 4095.0; 
   rpm_actual = extrapolarRPM(voltaje_taco_actual);
 
   if (modo_operacion == 0 || modo_operacion == 1) {
-    static float pot_filtrado = -1;
-    int raw_pot = analogRead(POT_PIN);
-    if (pot_filtrado < 0) pot_filtrado = raw_pot;
-    pot_filtrado = (0.02 * raw_pot) + (0.98 * pot_filtrado); 
+    if (!pot_bloqueado) {
+      static float pot_filtrado = -1;
+      int raw_pot = analogRead(POT_PIN);
+      if (pot_filtrado < 0) pot_filtrado = raw_pot;
+      pot_filtrado = (0.01 * raw_pot) + (0.99 * pot_filtrado); 
 
-    int pot_suave = round(pot_filtrado);
-    static int last_pot_suave = pot_suave;
+      int pot_suave = round(pot_filtrado);
+      static int last_pot_suave = pot_suave;
 
-    if (abs(pot_suave - last_pot_suave) > 15) {
-      last_pot_suave = pot_suave;
-      alpha_objetivo = map(pot_suave, 0, 4095, limite_inferior_alfa, limite_superior_alfa);
+      if (abs(pot_suave - last_pot_suave) > 25) {
+        last_pot_suave = pot_suave;
+        alpha_objetivo = map(pot_suave, 0, 4095, limite_inferior_alfa, limite_superior_alfa);
+      }
     }
   } 
   else if (modo_operacion == 2) {
     alpha_objetivo = calcular_alfa_control((float)rpm_objetivo_web, (float)rpm_actual, alpha_actual, limite_inferior_alfa, limite_superior_alfa);
+    
+    static unsigned long tiempoAnteriorRampaP7 = 0;
+    if (sistema_encendido && abs(alpha_objetivo - alpha_actual) > 2) {
+      if (tiempoActual - tiempoAnteriorRampaP7 >= (unsigned long)velocidad_rampa_p7) {
+        tiempoAnteriorRampaP7 = tiempoActual;
+        if (alpha_actual > alpha_objetivo) alpha_actual--;
+        else if (alpha_actual < alpha_objetivo) alpha_actual++;
+      }
+    }
   }
 
   if (sistema_encendido) {
-    if (tiempoActual - tiempoAnteriorRampa >= (unsigned long)velocidad_rampa_on) {
-      tiempoAnteriorRampa = tiempoActual;
-      if (alpha_actual > alpha_objetivo) alpha_actual--;
-      else if (alpha_actual < alpha_objetivo) alpha_actual++;
+    if (alpha_actual > limite_superior_alfa) {
+      alpha_actual = limite_superior_alfa;
+    }
+    
+    if (modo_operacion != 2) { 
+      if (tiempoActual - tiempoAnteriorRampa >= (unsigned long)velocidad_rampa_on) {
+        tiempoAnteriorRampa = tiempoActual;
+        if (alpha_actual > alpha_objetivo) alpha_actual--;
+        else if (alpha_actual < alpha_objetivo) alpha_actual++;
+      }
     }
   } else {
-    if (alpha_actual < 180) {
+    if (alpha_actual < limite_superior_alfa) {
       if (tiempoActual - tiempoAnteriorRampa >= (unsigned long)velocidad_rampa_off) {
         tiempoAnteriorRampa = tiempoActual;
         alpha_actual++; 
       }
+    } else {
+      alpha_actual = limite_superior_alfa + 1;
     }
   }
 
