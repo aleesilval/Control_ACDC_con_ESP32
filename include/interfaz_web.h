@@ -78,7 +78,6 @@ const char index_html[] PROGMEM = R"rawliteral(
     let sysPower = false;
     let currentMode = 0; 
     let limiteSupHW = 150; 
-    let potBloqueado = false;
     let invertirCanales = false;
 
     function switchTab(mode) {
@@ -102,14 +101,6 @@ const char index_html[] PROGMEM = R"rawliteral(
 
     function triggerZcdRecalib() {
       fetch('/recalib_zcd').then(() => { console.log("Comando de recalibración enviado."); });
-    }
-
-    function togglePotLock() {
-      potBloqueado = !potBloqueado;
-      const btn = document.getElementById('potLockBtn');
-      btn.innerText = potBloqueado ? '🔒 POTENCIÓMETRO BLOQUEADO' : '🔓 POTENCIÓMETRO ACTIVO';
-      btn.className = potBloqueado ? 'btn-lock pot-locked' : 'btn-lock pot-unlocked';
-      fetch('/lock_pot?state=' + (potBloqueado ? '1' : '0'));
     }
 
     function toggleInvertirCanales() {
@@ -224,16 +215,11 @@ const char index_html[] PROGMEM = R"rawliteral(
           document.getElementById('cfgPulso').value = vals[9];
           document.getElementById('cfgDesfase').value = vals[10];
           
-          potBloqueado = (vals[11] === '1');
-          invertirCanales = (vals[12] === '1');
-          document.getElementById('cfgRampaP7').value = vals[13];
+          invertirCanales = (vals[11] === '1');
+          document.getElementById('cfgRampaP7').value = vals[12];
           
           document.getElementById('sliderAlfa').min = vals[5];
           document.getElementById('sliderAlfa').max = vals[6];
-          
-          const pBtn = document.getElementById('potLockBtn');
-          pBtn.innerText = potBloqueado ? '🔒 POTENCIÓMETRO BLOQUEADO' : '🔓 POTENCIÓMETRO ACTIVO';
-          pBtn.className = potBloqueado ? 'btn-lock pot-locked' : 'btn-lock pot-unlocked';
 
           const invBtn = document.getElementById('invertChBtn');
           invBtn.innerText = invertirCanales ? '🔄 CANALES INVERTIDOS' : '🔃 INVERTIR CANALES';
@@ -246,12 +232,9 @@ const char index_html[] PROGMEM = R"rawliteral(
           btn.innerText = sysPower ? '🔴 DETENER SISTEMA' : '🟢 INICIAR SISTEMA';
           btn.className = sysPower ? 'btn-maestro power-off' : 'btn-maestro power-on';
 
-          // =================================================================
-          // CORRECCIÓN VITAL DE ÍNDICES: Los voltajes ahora arrancan en el índice 14
-          // =================================================================
           for(let i=0; i<10; i++) {
-            document.getElementById('v_' + i).value = vals[14 + i*2];
-            document.getElementById('rpm_' + i).value = vals[15 + i*2];
+            document.getElementById('v_' + i).value = vals[13 + i*2];
+            document.getElementById('rpm_' + i).value = vals[14 + i*2];
           }
         });
     };
@@ -335,7 +318,6 @@ const char index_html[] PROGMEM = R"rawliteral(
         <input type="text" id="alphaInput" class="value-input value-off" value="150" readonly>
         <input type="range" id="sliderAlfa" class="slider" min="10" max="150" value="150" onchange="sendAlphaUpdate(this.value)">
         
-        <button id="potLockBtn" onclick="togglePotLock()" class="btn-lock pot-unlocked">🔓 POTENCIÓMETRO ACTIVO</button>
         <button id="invertChBtn" onclick="toggleInvertirCanales()" class="btn-lock pot-unlocked" style="margin-top:8px;">🔃 INVERTIR CANALES</button>
 
         <div class="canvas-container">

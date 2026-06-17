@@ -17,7 +17,13 @@ void inicializar_controlador() {
     ultimo_tiempo_control = millis();
 }
 
-int calcular_alfa_control(float rpm_objetivo, float rpm_actual, int alfa_base, int lim_inf, int lim_sup) {
+int calcular_alfa_control(float rpm_objetivo, float rpm_actual, int alfa_base, int lim_inf, int lim_sup, bool sistema_activo) {
+    // PROTECCIÓN ANTI-WINDUP: Evita el latigazo de corriente al iniciar
+    if (!sistema_activo) {
+        error_acumulado = 0.0;
+        return lim_sup; // Mantiene el ángulo en la zona de apagado seguro
+    }
+
     unsigned long tiempo_actual = millis();
     unsigned long dt_ms = tiempo_actual - ultimo_tiempo_control;
 
