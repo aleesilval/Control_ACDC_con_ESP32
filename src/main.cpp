@@ -17,7 +17,13 @@ const int SCR_PAR_N_PIN = 18;
 const int TACO_PIN = 35;   
 
 // ==============================================================================
-// VARIABLES DE POTENCIA Y PLL DEDICADO
+// CONSTANTES METROLÓGICAS Y DE PROTECCIÓN
+// ==============================================================================
+static constexpr uint32_t ZCD_WATCHDOG_US    = 120000U; // 120ms de timeout para detectar caída AC
+static constexpr float EMA_ALPHA_TACO        = 0.1f;    // Peso del filtro pasa bajos (10%)
+
+// ==============================================================================
+// VARIABLES DE POTENCIA, PLL Y SINCRONIZACIÓN (Atómicas para ISR)
 // ==============================================================================
 volatile uint32_t tiempo_semiciclo = 8333; 
 volatile int estado_timer = 0;             
@@ -29,35 +35,42 @@ hw_timer_t *timer = NULL;
 volatile int zcd_muestras = 0;
 volatile uint32_t zcd_suma_tiempos = 0;
 volatile bool zcd_sintonizado = false;
+volatile bool transitorio_arranque = true; // Protección para evitar latigazos
 
 // ==============================================================================
-// VARIABLES DE SISTEMA Y CONFIGURACIÓN
+// VARIABLES DE SISTEMA Y CONFIGURACIÓN COMPARTIDAS (Volatile)
 // ==============================================================================
 Preferences preferencias;
 
 int modo_operacion = 0;           
 volatile bool sistema_encendido = false; 
 
-int limite_inferior_alfa = 10;
-int limite_superior_alfa = 150;
-int desfase_zcd_us = 0;
+volatile int limite_inferior_alfa = 10;
+volatile int limite_superior_alfa = 150;
+volatile int desfase_zcd_us = 0;
 
-int alpha_objetivo = 150;         
+volatile int alpha_objetivo = 150;         
 volatile int alpha_actual = 180; 
 
-int rpm_objetivo_web = 0; 
+volatile int rpm_objetivo_web = 0; 
 
 volatile int velocidad_rampa_on = 15; 
 volatile int velocidad_rampa_off = 45;
 volatile int velocidad_rampa_p7 = 3;
 volatile int ancho_pulso_us = 1000;  
 
-bool invertir_canales = false;
-
-unsigned long tiempoAnteriorRampa = 0;
+volatile bool invertir_canales = false;
 
 float voltaje_taco_actual = 0.0;
 int rpm_actual = 0;
+
+// ==============================================================================
+// MÁQUINA DE ESTADOS: CALIBRACIÓN SEMI-AUTOMÁTICA (Laboratorio)
+// ==============================================================================
+enum EstadoCalib { CALIB_INACTIVO, CALIB_ESTABILIZANDO, CALIB_ESPERANDO_DATO };
+volatile EstadoCalib estado_calib = CALIB_INACTIVO;
+volatile int paso_actual_calib = 0;
+volatile float voltaje_taco_medido = 0;
 
 float calib_voltaje[10];
 float calib_rpm[10];
@@ -70,16 +83,18 @@ TaskHandle_t TareaWeb;
 // ==============================================================================
 // RUTINAS DE INTERRUPCIÓN (NÚCLEO 1) - CAPA DE HARDWARE PURA
 // ==============================================================================
+inline int obtener_pin_disparo(bool es_positivo) {
+    bool inv = invertir_canales;
+    if (es_positivo) return inv ? SCR_PAR_N_PIN : SCR_PAR_P_PIN;
+    return inv ? SCR_PAR_P_PIN : SCR_PAR_N_PIN;
+}
+
 void IRAM_ATTR onTimer() {
-  int pin_par_p = invertir_canales ? SCR_PAR_N_PIN : SCR_PAR_P_PIN;
-  int pin_par_n = invertir_canales ? SCR_PAR_P_PIN : SCR_PAR_N_PIN;
+  int pin_activo = obtener_pin_disparo(es_semiciclo_positivo);
+  int pin_inactivo = obtener_pin_disparo(!es_semiciclo_positivo);
   
   if (estado_timer == 1) { 
-    if (es_semiciclo_positivo) {
-      GPIO.out_w1ts = ((uint32_t)1 << pin_par_p); 
-    } else {
-      GPIO.out_w1ts = ((uint32_t)1 << pin_par_n); 
-    }
+    GPIO.out_w1ts = ((uint32_t)1 << pin_activo); 
     
     uint32_t margen_seguridad = 250; 
     uint32_t tiempo_restante = tiempo_semiciclo - retardo_actual_us;
@@ -95,7 +110,7 @@ void IRAM_ATTR onTimer() {
     timerAlarmEnable(timer);
     
   } else if (estado_timer == 2) {
-    GPIO.out_w1tc = ((uint32_t)1 << pin_par_p) | ((uint32_t)1 << pin_par_n);
+    GPIO.out_w1tc = ((uint32_t)1 << pin_activo) | ((uint32_t)1 << pin_inactivo);
     estado_timer = 0; 
   }
 }
@@ -109,11 +124,10 @@ void IRAM_ATTR zeroCrossISR() {
   timerAlarmDisable(timer);
   estado_timer = 0; 
   
-  // FILTRO ANTI-REBOTE CLÁSICO: Ignora el "chispazo" del switch sin actualizar el tiempo
+  // FILTRO ANTI-REBOTE (6.5ms)
   if (delta < 6500) return; 
 
   if (!zcd_sintonizado) {
-    // VENTANA CLÍNICA (7.5ms a 10ms). Solo acepta ondas puras para aprender.
     if (delta > 7500 && delta < 10000) {
       zcd_suma_tiempos += delta;
       zcd_muestras++;
@@ -126,19 +140,16 @@ void IRAM_ATTR zeroCrossISR() {
     } else {
       zcd_muestras = 0;
       zcd_suma_tiempos = 0;
+      transitorio_arranque = true; 
     }
     tiempo_ultimo_cruce = tiempo_actual;
     return; 
   }
   
-  // === MODO SINTONIZADO (RUNNING) ===
-  
   if (delta > 10000 || delta < 7500) {
      if (delta > 10000) {
         int ciclos_perdidos = round((float)delta / tiempo_semiciclo);
-        if (ciclos_perdidos % 2 != 0) {
-            es_semiciclo_positivo = !es_semiciclo_positivo; 
-        }
+        if (ciclos_perdidos % 2 != 0) es_semiciclo_positivo = !es_semiciclo_positivo; 
      }
      tiempo_ultimo_cruce = tiempo_actual;
      return; 
@@ -148,10 +159,11 @@ void IRAM_ATTR zeroCrossISR() {
   tiempo_ultimo_cruce = tiempo_actual; 
   es_semiciclo_positivo = !es_semiciclo_positivo;
   
-  // MURO DE SILENCIO ABSOLUTO
+  // MURO DE SILENCIO ABSOLUTO Y BLOQUEO POR TRANSITORIO
   if (!sistema_encendido && alpha_actual >= limite_superior_alfa) return;
   if (alpha_actual > limite_superior_alfa) return; 
-  
+  if (transitorio_arranque && alpha_actual > alpha_objetivo) return; // Mute durante rampa inicial
+
   int retardo_teorico = (alpha_actual * tiempo_semiciclo) / 180;
   retardo_actual_us = retardo_teorico + desfase_zcd_us;
   
@@ -186,7 +198,7 @@ int extrapolarRPM(float v) {
 }
 
 // ==============================================================================
-// TAREA NÚCLEO 0
+// TAREA NÚCLEO 0 (SERVIDOR WEB Y ENDPOINTS)
 // ==============================================================================
 void tareaNucleoCero(void * parameter) {
   preferencias.begin("control", false);
@@ -233,11 +245,55 @@ void tareaNucleoCero(void * parameter) {
     request->send(200, "text/plain", "OK");
   });
 
+  // --- Endpoints de Calibración ---
+  server.on("/auto_calib", HTTP_GET, [](AsyncWebServerRequest *request){
+    if(request->hasParam("action")) {
+      String act = request->getParam("action")->value();
+      if(act == "start") {
+        estado_calib = CALIB_ESTABILIZANDO;
+        paso_actual_calib = 0;
+        sistema_encendido = true;
+      } else if (act == "stop") {
+        estado_calib = CALIB_INACTIVO;
+        sistema_encendido = false;
+      }
+    }
+    request->send(200, "text/plain", "OK");
+  });
+
+  server.on("/step_calib", HTTP_GET, [](AsyncWebServerRequest *request){
+    if(estado_calib == CALIB_ESPERANDO_DATO && request->hasParam("rpm_real")) {
+      calib_voltaje[paso_actual_calib] = voltaje_taco_medido;
+      calib_rpm[paso_actual_calib] = request->getParam("rpm_real")->value().toFloat();
+      
+      paso_actual_calib++;
+      if(paso_actual_calib >= 10) {
+        estado_calib = CALIB_INACTIVO;
+        sistema_encendido = false;
+        // Guardar en flash automáticamente al terminar
+        for(int i=0; i<10; i++) {
+          preferencias.putFloat(String("v"+String(i)).c_str(), calib_voltaje[i]);
+          preferencias.putFloat(String("r"+String(i)).c_str(), calib_rpm[i]);
+        }
+      } else {
+        estado_calib = CALIB_ESTABILIZANDO; 
+      }
+    }
+    request->send(200, "text/plain", "OK");
+  });
+
+  server.on("/get_calib", HTTP_GET, [](AsyncWebServerRequest *request){
+    String payload = String(estado_calib) + "," + String(paso_actual_calib) + "," + String(voltaje_taco_medido, 2);
+    request->send(200, "text/plain", payload);
+  });
+  // --------------------------------
+
   server.on("/recalib_zcd", HTTP_GET, [](AsyncWebServerRequest *request){
     sistema_encendido = false; 
     zcd_sintonizado = false;
     zcd_muestras = 0;
     zcd_suma_tiempos = 0;
+    transitorio_arranque = true;
     GPIO.out_w1tc = ((uint32_t)1 << SCR_PAR_P_PIN) | ((uint32_t)1 << SCR_PAR_N_PIN);
     timerAlarmDisable(timer);
     estado_timer = 0;
@@ -249,7 +305,6 @@ void tareaNucleoCero(void * parameter) {
     if (request->hasParam("lim_inf")) { limite_inferior_alfa = request->getParam("lim_inf")->value().toInt(); preferencias.putInt("lim_inf", limite_inferior_alfa); }
     if (request->hasParam("lim_sup")) { 
         int val_web = request->getParam("lim_sup")->value().toInt(); 
-        // BLOQUEO HARDWARE CONTRA CORTOCIRCUITOS CRUZADOS
         limite_superior_alfa = constrain(val_web, limite_inferior_alfa, 160); 
         preferencias.putInt("lim_sup", limite_superior_alfa); 
     }
@@ -267,20 +322,6 @@ void tareaNucleoCero(void * parameter) {
       preferencias.putBool("inv_ch", invertir_canales);
     }
     request->send(200, "text/plain", String(invertir_canales ? "1" : "0"));
-  });
-
-  server.on("/save_calib", HTTP_GET, [](AsyncWebServerRequest *request){
-    for(int i=0; i<10; i++) {
-      String keyV = "v" + String(i);
-      String keyR = "rpm" + String(i);
-      if(request->hasParam(keyV.c_str()) && request->hasParam(keyR.c_str())) {
-        calib_voltaje[i] = request->getParam(keyV.c_str())->value().toFloat();
-        calib_rpm[i] = request->getParam(keyR.c_str())->value().toFloat();
-        preferencias.putFloat(String("v"+String(i)).c_str(), calib_voltaje[i]);
-        preferencias.putFloat(String("r"+String(i)).c_str(), calib_rpm[i]);
-      }
-    }
-    request->send(200, "text/plain", "OK");
   });
 
   server.on("/set", HTTP_GET, [](AsyncWebServerRequest *request){
@@ -309,6 +350,7 @@ void tareaNucleoCero(void * parameter) {
   server.on("/power", HTTP_GET, [](AsyncWebServerRequest *request){
     if (request->hasParam("state")) {
       sistema_encendido = (request->getParam("state")->value() == "1"); 
+      if(sistema_encendido) transitorio_arranque = true; // Activar soft-start seguro
     }
     request->send(200, "text/plain", "OK");
   });
@@ -321,9 +363,6 @@ void tareaNucleoCero(void * parameter) {
   server.on("/get_config", HTTP_GET, [](AsyncWebServerRequest *request){
     String payload = String(kp_lineal, 4) + "," + String(ki_lineal, 4) + "," + String(rpm_objetivo_web) + "," + String(modo_operacion) + "," + String(sistema_encendido ? 1 : 0) + "," + 
                      String(limite_inferior_alfa) + "," + String(limite_superior_alfa) + "," + String(velocidad_rampa_on) + "," + String(velocidad_rampa_off) + "," + String(ancho_pulso_us) + "," + String(desfase_zcd_us) + "," + String(invertir_canales ? 1 : 0) + "," + String(velocidad_rampa_p7);
-    for(int i=0; i<10; i++) {
-      payload += "," + String(calib_voltaje[i], 2) + "," + String((int)calib_rpm[i]);
-    }
     request->send(200, "text/plain", payload);
   });
 
@@ -374,11 +413,11 @@ void setup() {
 // LAZO DE CONTROL ESTRICTO (NÚCLEO 1)
 // ==============================================================================
 void loop() {
-  unsigned long tiempoActual = millis();
+  unsigned long m_actual = micros();
+  unsigned long t_cruce = tiempo_ultimo_cruce;
 
-  // WATCHDOG ASÍNCRONO DE HARDWARE
-  unsigned long micros_actuales = micros();
-  if (micros_actuales - tiempo_ultimo_cruce > 200000) { 
+  // WATCHDOG ASÍNCRONO BLINDADO CONTRA UNDERFLOW
+  if (m_actual >= t_cruce && (m_actual - t_cruce > ZCD_WATCHDOG_US)) { 
     if (zcd_sintonizado || zcd_muestras > 0) {
       Serial.println("[WATCHDOG] Señal AC perdida. Reseteando sintonía...");
       sistema_encendido = false; 
@@ -386,6 +425,7 @@ void loop() {
       zcd_sintonizado = false;
       zcd_muestras = 0;
       zcd_suma_tiempos = 0;
+      transitorio_arranque = true;
       
       GPIO.out_w1tc = ((uint32_t)1 << SCR_PAR_P_PIN) | ((uint32_t)1 << SCR_PAR_N_PIN);
       timerAlarmDisable(timer);
@@ -394,42 +434,65 @@ void loop() {
     }
   }
 
-  // LECTURA EXCLUSIVA DE PERIFÉRICOS ÚTILES (El potenciómetro fue erradicado de aquí)
+  // LECTURA DEL TACO CON FILTRO EMA (Optimizado sin Potenciómetro)
+  static float voltaje_taco_filtrado = 0;
   int raw_taco = analogRead(TACO_PIN);
-  voltaje_taco_actual = (raw_taco * 3.3) / 4095.0; 
+  float v_inst = (raw_taco * 3.3) / 4095.0; 
+  voltaje_taco_filtrado = (EMA_ALPHA_TACO * v_inst) + ((1.0f - EMA_ALPHA_TACO) * voltaje_taco_filtrado);
+  voltaje_taco_actual = voltaje_taco_filtrado;
   rpm_actual = extrapolarRPM(voltaje_taco_actual);
 
-  // MODO 2: PID CON ANTI-WINDUP 
-  if (modo_operacion == 2) {
-    alpha_objetivo = calcular_alfa_control((float)rpm_objetivo_web, (float)rpm_actual, alpha_actual, limite_inferior_alfa, limite_superior_alfa, sistema_encendido);
-    
-    static unsigned long tiempoAnteriorRampaP7 = 0;
-    if (sistema_encendido && abs(alpha_objetivo - alpha_actual) > 2) {
-      if (tiempoActual - tiempoAnteriorRampaP7 >= (unsigned long)velocidad_rampa_p7) {
-        tiempoAnteriorRampaP7 = tiempoActual;
-        if (alpha_actual > alpha_objetivo) alpha_actual--;
-        else if (alpha_actual < alpha_objetivo) alpha_actual++;
+  // MÁQUINA DE ESTADOS: CALIBRACIÓN SEMI-AUTOMÁTICA
+  static unsigned long tiempo_inicio_paso = 0;
+  if (estado_calib != CALIB_INACTIVO) {
+      switch(estado_calib) {
+          case CALIB_ESTABILIZANDO:
+              // Fija el ángulo de fase de forma escalonada (10 pasos)
+              alpha_objetivo = limite_superior_alfa - (paso_actual_calib * ((limite_superior_alfa - limite_inferior_alfa) / 9));
+              
+              // Otorga 3.5 segundos para la estabilización mecánica completa del motor
+              if (millis() - tiempo_inicio_paso > 3500) {
+                  voltaje_taco_medido = voltaje_taco_actual;
+                  estado_calib = CALIB_ESPERANDO_DATO; // Pausa el flujo, esperando input web
+              }
+              break;
+          case CALIB_ESPERANDO_DATO:
+              // Mantiene la retención del tiempo mientras espera la lectura del tacómetro láser
+              tiempo_inicio_paso = millis(); 
+              break;
+          default:
+              break;
       }
+  }
+
+  // LAZO CERRADO PI (Modo P7) - Enlazado directo al Slider Web
+  static unsigned long tiempoAnteriorRampaP7 = 0;
+  if (modo_operacion == 2 && sistema_encendido && estado_calib == CALIB_INACTIVO) {
+    if (millis() - tiempoAnteriorRampaP7 >= 20) {
+        tiempoAnteriorRampaP7 = millis();
+        // El slider virtual escribe directamente en rpm_objetivo_web, con el PI protegido por el transitorio
+        alpha_objetivo = calcular_alfa_control((float)rpm_objetivo_web, (float)rpm_actual, alpha_actual, limite_inferior_alfa, limite_superior_alfa, sistema_encendido, transitorio_arranque);
     }
   }
 
-  // GESTIÓN DE RAMPAS MANUALES
+  // GESTIÓN DE RAMPAS GLOBALES
+  static unsigned long tiempoAnteriorRampa = 0;
   if (sistema_encendido) {
-    if (alpha_actual > limite_superior_alfa) {
-      alpha_actual = limite_superior_alfa;
-    }
+    if (alpha_actual > limite_superior_alfa) alpha_actual = limite_superior_alfa;
     
-    if (modo_operacion != 2) { 
-      if (tiempoActual - tiempoAnteriorRampa >= (unsigned long)velocidad_rampa_on) {
-        tiempoAnteriorRampa = tiempoActual;
-        if (alpha_actual > alpha_objetivo) alpha_actual--;
-        else if (alpha_actual < alpha_objetivo) alpha_actual++;
-      }
+    int delay_rampa = (modo_operacion == 2) ? velocidad_rampa_p7 : velocidad_rampa_on;
+    if (millis() - tiempoAnteriorRampa >= (unsigned long)delay_rampa) {
+      tiempoAnteriorRampa = millis();
+      if (alpha_actual > alpha_objetivo) alpha_actual--;
+      else if (alpha_actual < alpha_objetivo) alpha_actual++;
+      
+      // Apaga el bloqueo de disparo al finalizar el arranque en frío
+      if (alpha_actual == alpha_objetivo) transitorio_arranque = false;
     }
   } else {
     if (alpha_actual < limite_superior_alfa) {
-      if (tiempoActual - tiempoAnteriorRampa >= (unsigned long)velocidad_rampa_off) {
-        tiempoAnteriorRampa = tiempoActual;
+      if (millis() - tiempoAnteriorRampa >= (unsigned long)velocidad_rampa_off) {
+        tiempoAnteriorRampa = millis();
         alpha_actual++; 
       }
     } else {

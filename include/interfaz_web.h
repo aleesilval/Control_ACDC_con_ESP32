@@ -80,6 +80,10 @@ const char index_html[] PROGMEM = R"rawliteral(
     let limiteSupHW = 150; 
     let invertirCanales = false;
 
+    // Controladores de Debounce para Sliders
+    let timerAlfa;
+    let timerSetpoint;
+
     function switchTab(mode) {
       if(sysPower) {
         alert("¡OPERACIÓN DENEGADA!\nEl puente SCR debe estar completamente APAGADO para cambiar de modo.");
@@ -100,7 +104,7 @@ const char index_html[] PROGMEM = R"rawliteral(
     }
 
     function triggerZcdRecalib() {
-      fetch('/recalib_zcd').then(() => { console.log("Comando de recalibración enviado."); });
+      fetch('/recalib_zcd');
     }
 
     function toggleInvertirCanales() {
@@ -111,14 +115,34 @@ const char index_html[] PROGMEM = R"rawliteral(
       fetch('/invert_ch?state=' + (invertirCanales ? '1' : '0'));
     }
 
-    function sendAlphaUpdate(val) {
+    // Slider P5 (Manual) - Actualiza UI en tiempo real y hace Fetch con retardo
+    function handleAlfaDrag(val) {
       document.getElementById('sliderAlfa').value = val;
-      fetch('/set?alpha=' + val);
+      clearTimeout(timerAlfa);
+      timerAlfa = setTimeout(() => {
+        fetch('/set?alpha=' + val);
+      }, 150);
     }
 
-    function sendSetpointUpdate(val) {
+    // Slider P7 (Lazo Cerrado) - Actualiza UI en tiempo real y hace Fetch con retardo
+    function handleSetpointDrag(val) {
       document.getElementById('lblSetpoint').innerText = val + ' RPM';
-      fetch('/setpoint?rpm=' + val);
+      clearTimeout(timerSetpoint);
+      timerSetpoint = setTimeout(() => {
+        fetch('/setpoint?rpm=' + val);
+      }, 150);
+    }
+
+    // FSM Calibración: Enviar medición experimental
+    function sendCalibStep() {
+      let rpm = document.getElementById('inputRpmReal').value;
+      if(rpm === '' || isNaN(rpm) || rpm < 0) { 
+        alert("Por favor, ingresa un valor numérico válido de RPM leído en el instrumento."); 
+        return; 
+      }
+      fetch('/step_calib?rpm_real=' + rpm).then(() => {
+          document.getElementById('inputRpmReal').value = '';
+      });
     }
 
     function toggleModal(show) {
@@ -170,7 +194,7 @@ const char index_html[] PROGMEM = R"rawliteral(
         let rpm = document.getElementById('rpm_' + i).value;
         params.push('v' + i + '=' + v + '&rpm' + i + '=' + rpm);
       }
-      fetch('/save_calib?' + params.join('&')).then(() => alert("Tabla guardada."));
+      fetch('/save_calib?' + params.join('&')).then(() => alert("Tabla de caracterización guardada en Flash."));
     }
 
     function sendTuneUpdate() {
@@ -239,6 +263,7 @@ const char index_html[] PROGMEM = R"rawliteral(
         });
     };
 
+    // Polling Rápido: Telemetría General (150ms)
     setInterval(() => {
       fetch('/get')
         .then(res => res.text())
@@ -281,6 +306,41 @@ const char index_html[] PROGMEM = R"rawliteral(
           }
         });
     }, 150);
+
+    // Polling Lento: FSM de Calibración Experimental (500ms)
+    setInterval(() => {
+      if (currentMode === 1) { 
+        fetch('/get_calib')
+          .then(res => res.text())
+          .then(data => {
+            let parts = data.split(',');
+            let state = parseInt(parts[0]);
+            let step = parseInt(parts[1]);
+            let volt = parseFloat(parts[2]).toFixed(2);
+            
+            if (state === 0) { // CALIB_INACTIVO
+                document.getElementById('calibIdle').style.display = 'block';
+                document.getElementById('calibActive').style.display = 'none';
+            } else {
+                document.getElementById('calibIdle').style.display = 'none';
+                document.getElementById('calibActive').style.display = 'block';
+                document.getElementById('calibStep').innerText = (step + 1) + '/10';
+                
+                if (state === 1) { // CALIB_ESTABILIZANDO
+                    document.getElementById('calibStatus').innerText = '⏳ Estabilizando motor (espera 3.5s)...';
+                    document.getElementById('calibStatus').style.color = '#f97316';
+                    document.getElementById('calibInputArea').style.display = 'none';
+                } else if (state === 2) { // CALIB_ESPERANDO_DATO
+                    document.getElementById('calibStatus').innerText = '✅ Estabilizado. Ingrese lectura experimental:';
+                    document.getElementById('calibStatus').style.color = '#10b981';
+                    document.getElementById('calibVolt').innerText = volt + ' V';
+                    document.getElementById('calibInputArea').style.display = 'block';
+                }
+            }
+          });
+      }
+    }, 500);
+
   </script>
 </head>
 <body>
@@ -316,7 +376,7 @@ const char index_html[] PROGMEM = R"rawliteral(
       <div class="display-box">
         <span class="lbl">Ángulo de Disparo Real (α)</span>
         <input type="text" id="alphaInput" class="value-input value-off" value="150" readonly>
-        <input type="range" id="sliderAlfa" class="slider" min="10" max="150" value="150" onchange="sendAlphaUpdate(this.value)">
+        <input type="range" id="sliderAlfa" class="slider" min="10" max="150" value="150" oninput="handleAlfaDrag(this.value)">
         
         <button id="invertChBtn" onclick="toggleInvertirCanales()" class="btn-lock pot-unlocked" style="margin-top:8px;">🔃 INVERTIR CANALES</button>
 
@@ -328,8 +388,30 @@ const char index_html[] PROGMEM = R"rawliteral(
 
     <div class="tab-content" id="tab-calib">
       <div class="display-box" style="display: flex; justify-content: space-around;">
-        <div><span class="lbl">Velocidad Filtrada</span><div id="rpmDisplay" style="font-size:26px; color:#10b981; font-weight:bold;">0 RPM</div></div>
-        <div><span class="lbl">Voltaje en Pin 35</span><div id="voltDisplay" style="font-size:24px; color:#facc15; font-weight:bold;">0.00 V</div></div>
+        <div><span class="lbl">Velocidad Estimada</span><div id="rpmDisplay" style="font-size:26px; color:#10b981; font-weight:bold;">0 RPM</div></div>
+        <div><span class="lbl">Voltaje TAC (Pin 35)</span><div id="voltDisplay" style="font-size:24px; color:#facc15; font-weight:bold;">0.00 V</div></div>
+      </div>
+      
+      <div class="display-box" style="margin-top: 5px; border-color: #38bdf8;">
+        <span class="lbl" style="color: #38bdf8;">Caracterización Dinámica de Planta</span>
+        
+        <div id="calibIdle">
+            <button onclick="fetch('/auto_calib?action=start')" style="width:100%; padding:12px; background:#10b981; border:none; border-radius:8px; color:white; font-weight:bold; cursor:pointer; margin-top:10px;">▶ INICIAR TOMA DE DATOS</button>
+        </div>
+        
+        <div id="calibActive" style="display:none; margin-top:10px;">
+            <div style="font-size:14px; color:#e2e8f0; margin-bottom:10px;">Punto de evaluación: <span id="calibStep" style="font-weight:bold; color:#facc15;">1/10</span></div>
+            <div id="calibStatus" style="font-size:12px; margin-bottom:10px; font-weight:bold;">Estabilizando...</div>
+            
+            <div id="calibInputArea" style="display:none; background:#1e293b; padding:15px; border-radius:8px; border:1px solid #475569;">
+                <label style="font-size:13px; color:#94a3b8; display:block; margin-bottom:10px;">Tensión anclada: <span id="calibVolt" style="color:#facc15; font-size:16px;">0.00 V</span></label>
+                <label style="font-size:12px; color:#e2e8f0; display:block; margin-bottom:5px;">Introduce las RPM reales leídas:</label>
+                <input type="number" id="inputRpmReal" style="width:100%; padding:10px; border-radius:6px; border:1px solid #334155; background:#0f172a; color:#10b981; font-size:18px; font-weight:bold; text-align:center; margin-bottom:12px;" placeholder="Ej. 1250">
+                <button onclick="sendCalibStep()" style="width:100%; padding:12px; background:#38bdf8; border:none; border-radius:6px; color:#0f172a; font-weight:bold; cursor:pointer;">AVANZAR AL SIGUIENTE PASO ⏭</button>
+            </div>
+            
+            <button onclick="fetch('/auto_calib?action=stop')" style="width:100%; padding:10px; background:#ef4444; border:none; border-radius:6px; color:white; font-weight:bold; cursor:pointer; margin-top:10px;">🛑 CANCELAR CARACTERIZACIÓN</button>
+        </div>
       </div>
     </div>
 
@@ -339,7 +421,7 @@ const char index_html[] PROGMEM = R"rawliteral(
         <div id="rpmControlDisplay" style="font-size:48px; color:#38bdf8; font-weight:bold;">0 RPM</div>
         
         <span class="lbl" style="margin-top:20px;">Consigna de Velocidad: <span id="lblSetpoint" style="color:#facc15;">0 RPM</span></span>
-        <input type="range" id="sliderSetpoint" class="slider" min="0" max="1500" value="0" oninput="document.getElementById('lblSetpoint').innerText = this.value + ' RPM'" onchange="sendSetpointUpdate(this.value)">
+        <input type="range" id="sliderSetpoint" class="slider" min="0" max="1500" value="0" oninput="handleSetpointDrag(this.value)">
       </div>
     </div>
   </div>
